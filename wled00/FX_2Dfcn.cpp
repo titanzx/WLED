@@ -36,14 +36,9 @@
 // so matrix should disable regular ledmap processing
 void WS2812FX::setUpMatrix() {
 #ifndef WLED_DISABLE_2D
-  // erase old ledmap, just in case.
-  if (customMappingTable != nullptr) delete[] customMappingTable;
-  customMappingTable = nullptr;
-  customMappingSize = 0;
-
   // isMatrix is set in cfg.cpp or set.cpp
   if (isMatrix) {
-    // calculate width dynamically because it will have gaps
+    // calculate width dynamically because it may have gaps
     Segment::maxWidth = 1;
     Segment::maxHeight = 1;
     for (size_t i = 0; i < panel.size(); i++) {
@@ -68,15 +63,18 @@ void WS2812FX::setUpMatrix() {
       return;
     }
 
-    customMappingTable = new uint16_t[Segment::maxWidth * Segment::maxHeight];
+    customMappingSize = 0; // prevent use of mapping if anything goes wrong
 
-    if (customMappingTable != nullptr) {
-      customMappingSize = Segment::maxWidth * Segment::maxHeight;
+    if (customMappingTable) delete[] customMappingTable;
+    customMappingTable = new uint16_t[getLengthTotal()];
+
+    if (customMappingTable) {
+      customMappingSize = getLengthTotal();
 
       // fill with empty in case we don't fill the entire matrix
-      for (size_t i = 0; i< customMappingSize; i++) {
-        customMappingTable[i] = (uint16_t)-1;
-      }
+      unsigned matrixSize = Segment::maxWidth * Segment::maxHeight;
+      for (unsigned i = 0; i<matrixSize; i++) customMappingTable[i] = 0xFFFFU;
+      for (unsigned i = matrixSize; i<getLengthTotal(); i++) customMappingTable[i] = i; // trailing LEDs for ledmap (after matrix) if it exist
 
       // we will try to load a "gap" array (a JSON file)
       // the array has to have the same amount of values as mapping array (or larger)
@@ -94,14 +92,14 @@ void WS2812FX::setUpMatrix() {
         DEBUG_PRINT(F("Reading LED gap from "));
         DEBUG_PRINTLN(fileName);
         // read the array into global JSON buffer
-        if (readObjectFromFile(fileName, nullptr, &doc)) {
+        if (readObjectFromFile(fileName, nullptr, pDoc)) {
           // the array is similar to ledmap, except it has only 3 values:
           // -1 ... missing pixel (do not increase pixel count)
           //  0 ... inactive pixel (it does count, but should be mapped out (-1))
           //  1 ... active pixel (it will count and will be mapped)
-          JsonArray map = doc.as<JsonArray>();
+          JsonArray map = pDoc->as<JsonArray>();
           gapSize = map.size();
-          if (!map.isNull() && gapSize >= customMappingSize) { // not an empty map
+          if (!map.isNull() && gapSize >= matrixSize) { // not an empty map
             gapTable = new int8_t[gapSize];
             if (gapTable) for (size_t i = 0; i < gapSize; i++) {
               gapTable[i] = constrain(map[i], -1, 1);
@@ -136,12 +134,12 @@ void WS2812FX::setUpMatrix() {
       DEBUG_PRINT(F("Matrix ledmap:"));
       for (unsigned i=0; i<customMappingSize; i++) {
         if (!(i%Segment::maxWidth)) DEBUG_PRINTLN();
-        DEBUG_PRINTF("%4d,", customMappingTable[i]);
+        DEBUG_PRINTF_P(PSTR("%4d,"), customMappingTable[i]);
       }
       DEBUG_PRINTLN();
       #endif
     } else { // memory allocation error
-      DEBUG_PRINTLN(F("Ledmap alloc error."));
+      DEBUG_PRINTLN(F("ERROR 2D LED map allocation error."));
       isMatrix = false;
       panels = 0;
       panel.clear();
@@ -177,11 +175,7 @@ void IRAM_ATTR Segment::setPixelColorXY(int x, int y, uint32_t col)
 
   uint8_t _bri_t = currentBri();
   if (_bri_t < 255) {
-    byte r = scale8(R(col), _bri_t);
-    byte g = scale8(G(col), _bri_t);
-    byte b = scale8(B(col), _bri_t);
-    byte w = scale8(W(col), _bri_t);
-    col = RGBW32(r, g, b, w);
+    col = color_fade(col, _bri_t);
   }
 
   if (reverse  ) x = virtualWidth()  - x - 1;
@@ -220,6 +214,7 @@ void IRAM_ATTR Segment::setPixelColorXY(int x, int y, uint32_t col)
   }
 }
 
+#ifdef WLED_USE_AA_PIXELS
 // anti-aliased version of setPixelColorXY()
 void Segment::setPixelColorXY(float x, float y, uint32_t col, bool aa)
 {
@@ -263,9 +258,10 @@ void Segment::setPixelColorXY(float x, float y, uint32_t col, bool aa)
     setPixelColorXY(uint16_t(roundf(fX)), uint16_t(roundf(fY)), col);
   }
 }
+#endif
 
 // returns RGBW values of pixel
-uint32_t Segment::getPixelColorXY(uint16_t x, uint16_t y) {
+uint32_t IRAM_ATTR Segment::getPixelColorXY(int x, int y) {
   if (!isActive()) return 0; // not active
   if (x >= virtualWidth() || y >= virtualHeight() || x<0 || y<0) return 0;  // if pixel would fall out of virtual segment just exit
   if (reverse  ) x = virtualWidth()  - x - 1;
@@ -277,77 +273,70 @@ uint32_t Segment::getPixelColorXY(uint16_t x, uint16_t y) {
   return strip.getPixelColorXY(start + x, startY + y);
 }
 
-// Blends the specified color with the existing pixel color.
-void Segment::blendPixelColorXY(uint16_t x, uint16_t y, uint32_t color, uint8_t blend) {
-  setPixelColorXY(x, y, color_blend(getPixelColorXY(x,y), color, blend));
-}
-
-// Adds the specified color with the existing pixel color perserving color balance.
-void Segment::addPixelColorXY(int x, int y, uint32_t color, bool fast) {
-  if (!isActive()) return; // not active
-  if (x >= virtualWidth() || y >= virtualHeight() || x<0 || y<0) return;  // if pixel would fall out of virtual segment just exit
-  setPixelColorXY(x, y, color_add(getPixelColorXY(x,y), color, fast));
-}
-
-void Segment::fadePixelColorXY(uint16_t x, uint16_t y, uint8_t fade) {
-  if (!isActive()) return; // not active
-  setPixelColorXY(x, y, color_fade(getPixelColorXY(x,y), fade, true));
-}
-
 // blurRow: perform a blur on a row of a rectangular matrix
-void Segment::blurRow(uint16_t row, fract8 blur_amount) {
+void Segment::blurRow(uint32_t row, fract8 blur_amount, bool smear){
   if (!isActive() || blur_amount == 0) return; // not active
   const uint_fast16_t cols = virtualWidth();
   const uint_fast16_t rows = virtualHeight();
 
   if (row >= rows) return;
   // blur one row
-  uint8_t keep = 255 - blur_amount;
+  uint8_t keep = smear ? 255 : 255 - blur_amount;
   uint8_t seep = blur_amount >> 1;
-  CRGB carryover = CRGB::Black;
+  uint32_t carryover = BLACK;
+  uint32_t lastnew;
+  uint32_t last;
+  uint32_t curnew = BLACK;
   for (unsigned x = 0; x < cols; x++) {
-    CRGB cur = getPixelColorXY(x, row);
-    CRGB before = cur;     // remember color before blur
-    CRGB part = cur;
-    part.nscale8(seep);
-    cur.nscale8(keep);
-    cur += carryover;
-    if (x>0) {
-      CRGB prev = CRGB(getPixelColorXY(x-1, row)) + part;
-      setPixelColorXY(x-1, row, prev);
-    }
-    if (before != cur)         // optimization: only set pixel if color has changed
-      setPixelColorXY(x, row, cur);
+    uint32_t cur = getPixelColorXY(x, row);
+    uint32_t part = color_fade(cur, seep);
+    curnew = color_fade(cur, keep);
+    if (x > 0) {
+      if (carryover)
+        curnew = color_add(curnew, carryover, true);
+      uint32_t prev = color_add(lastnew, part, true);
+      if (last != prev) // optimization: only set pixel if color has changed
+        setPixelColorXY(x - 1, row, prev);
+    } else // first pixel
+      setPixelColorXY(x, row, curnew);
+    lastnew = curnew;
+    last = cur; // save original value for comparison on next iteration
     carryover = part;
   }
+  setPixelColorXY(cols-1, row, curnew); // set last pixel
 }
 
 // blurCol: perform a blur on a column of a rectangular matrix
-void Segment::blurCol(uint16_t col, fract8 blur_amount) {
+void Segment::blurCol(uint32_t col, fract8 blur_amount, bool smear) {
   if (!isActive() || blur_amount == 0) return; // not active
   const uint_fast16_t cols = virtualWidth();
   const uint_fast16_t rows = virtualHeight();
 
   if (col >= cols) return;
   // blur one column
-  uint8_t keep = 255 - blur_amount;
+  uint8_t keep = smear ? 255 : 255 - blur_amount;
   uint8_t seep = blur_amount >> 1;
-  CRGB carryover = CRGB::Black;
+  uint32_t carryover = BLACK;
+  uint32_t lastnew;
+  uint32_t last;
+  uint32_t curnew = BLACK;
   for (unsigned y = 0; y < rows; y++) {
-    CRGB cur = getPixelColorXY(col, y);
-    CRGB part = cur;
-    CRGB before = cur;     // remember color before blur
-    part.nscale8(seep);
-    cur.nscale8(keep);
-    cur += carryover;
-    if (y>0) {
-      CRGB prev = CRGB(getPixelColorXY(col, y-1)) + part;
-      setPixelColorXY(col, y-1, prev);
-    }
-    if (before != cur)         // optimization: only set pixel if color has changed
-      setPixelColorXY(col, y, cur);
-    carryover = part;
+    uint32_t cur = getPixelColorXY(col, y);
+    uint32_t part = color_fade(cur, seep);
+    curnew = color_fade(cur, keep);
+    if (y > 0) {
+      if (carryover)
+        curnew = color_add(curnew, carryover, true);
+      uint32_t prev = color_add(lastnew, part, true);      
+      if (last != prev) // optimization: only set pixel if color has changed
+        setPixelColorXY(col, y - 1, prev);
+    } else // first pixel
+      setPixelColorXY(col, y, curnew);
+    lastnew = curnew;
+    last = cur; //save original value for comparison on next iteration
+    carryover = part;        
   }
+  setPixelColorXY(col, rows - 1, curnew);
 }
 
 // 1D Box blur (with added weight - blur_amount: [0=no blur, 255=max blur])
